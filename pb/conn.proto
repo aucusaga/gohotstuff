@@ -1,0 +1,17 @@
+syntax = "proto3";
+package gohotstuff.pb;
+
+option go_package = ".;pb";
+
+message PacketMsg {
+  int32 channel_id = 1;
+  string module    = 2;
+  bool  eof        = 3;
+  bytes data       = 4;
+}
+
+message Packet {
+  oneof sum {
+    PacketMsg  packet_msg  = 3;
+  }
+}

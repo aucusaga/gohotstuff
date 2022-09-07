@@ -1,0 +1,53 @@
+syntax = "proto3";
+package gohotstuff.pb;
+
+option go_package = ".;pb";
+
+message Message {
+	string module                    = 1;
+	oneof sum {
+   	 	ProposalMessage proposal     = 2;
+		VoteMessage     vote         = 3;
+		TimoutMessage   timeout      = 4;
+  	}
+}
+
+message ProposalMessage {
+	string  module       = 1;
+	int64   round     	 = 2;
+	bytes   id        	 = 3;
+	int64   timestamp 	 = 4;
+	bytes   pid          = 5;
+	bytes   pk           = 6;
+	bytes   signature    = 7;
+	bytes   justify   	 = 8;
+}
+
+message VoteMessage {
+	string   module           = 1;
+	VoteInfo vote_info        = 2;
+	bytes    commit_info      = 3;
+	int64    timestamp        = 4;
+	bytes    pid      		  = 5;
+	bytes    pk    		      = 6;
+	bytes    signature 		  = 7;
+}
+
+message VoteInfo {
+	int64  proposal_round     = 1;
+	bytes  proposal_id        = 2;
+	int64  parent_round       = 3;
+	bytes  parent_id          = 4;
+}
+
+message TimoutMessage {
+	string module           = 1;
+	int64  round            = 2;
+	int64  parent_round     = 3;
+	bytes  parent_id        = 4;
+	int64  index            = 5;
+	int64  timestamp        = 6;
+	bytes  pid      	    = 7;
+	bytes  pk    		    = 8;
+	bytes  signature 	    = 9;
+}
