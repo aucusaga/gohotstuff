@@ -42,7 +42,10 @@ func NewQCTree(user PeerID, rootRound int64, rootID string, rootValue []byte,
 		nf = NewDefaultQuorumCert
 	}
 	qct := &BlockTree{
-		root:          nr,
+		root:    nr,
+		high:    nr,
+		generic: nr,
+
 		tree:          bt,
 		userID:        user,
 		deserializeF:  df,
@@ -74,10 +77,14 @@ func (t *BlockTree) ExecuteNInsert(qc QuorumCert) error {
 	if err != nil {
 		return err
 	}
+	bytesV, err := qc.Serialize()
+	if err != nil {
+		return err
+	}
 	block, err := t.tree.Insert(bt.Node{
 		Round:     currentRound,
 		ID:        string(currentID),
-		Value:     qc.Serialize(),
+		Value:     bytesV,
 		ParentKey: string(parentID),
 	})
 	// ignore repeat err

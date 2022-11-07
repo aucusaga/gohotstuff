@@ -2,7 +2,15 @@ package libs
 
 const (
 	ConsensusModule  = "consensus"
-	ConsensusChannel = 0
+	ConsensusChannel = int32(0)
+
+	HotstuffChaindStep = 3
+)
+
+var (
+	IDToModuleMap = map[int32]string{
+		ConsensusChannel: ConsensusModule,
+	}
 )
 
 type Reactor interface {

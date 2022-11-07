@@ -39,14 +39,19 @@ func (s *PeerSet) Range(f func(Peer) bool) chan bool {
 	defer s.mtx.Unlock()
 
 	ch := make(chan bool, len(s.list))
-	defer close(ch)
-
-	for _, peer := range s.list {
-		peer := peer
-		go func() {
-			ch <- f(peer)
-		}()
-	}
+	go func() {
+		defer close(ch)
+		var wg sync.WaitGroup
+		wg.Add(len(s.list))
+		for _, peer := range s.list {
+			peer := peer
+			go func() {
+				defer wg.Done()
+				ch <- f(peer)
+			}()
+		}
+		wg.Wait()
+	}()
 
 	return ch
 }
@@ -55,8 +60,15 @@ func (s *PeerSet) Add(peer Peer) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
+	var newOne []Peer
+	// delete the old one
 	if _, ok := s.lookup[peer.ID()]; ok {
-		return errors.New("peer has exist in the set")
+		for _, p := range s.list {
+			if p.ID() != peer.ID() {
+				newOne = append(newOne, p)
+			}
+		}
+		s.list = newOne
 	}
 	s.lookup[peer.ID()] = peer
 	s.list = append(s.list, peer)

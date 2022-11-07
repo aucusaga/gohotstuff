@@ -1,7 +1,6 @@
 package p2p
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"reflect"
@@ -16,7 +15,6 @@ import (
 )
 
 const (
-	defaultFlushTicker             = 100 * time.Millisecond
 	defaultSendTimeout             = 3 * time.Second
 	defaultMaxPacketMsgSize        = 1024
 	defaultMaxPacketMsgPayloadSize = 1024
@@ -36,15 +34,14 @@ type DefaultConn struct {
 	peer   NodeInfo
 	stream network.Stream
 
-	send         chan struct{}
-	flushTicker  *time.Ticker
+	send         chan int32
 	quit         chan struct{}
 	channels     []*Channel
 	channelsIdx  map[int32]*Channel
 	onReceiveIdx map[Module]libs.Reactor
 
 	reader        ggio.ReadCloser
-	bufConnWriter *bufio.Writer
+	bufConnWriter ggio.WriteCloser
 
 	log libs.Logger
 }
@@ -54,14 +51,13 @@ func NewDefaultConn(peer NodeInfo, netStream network.Stream,
 	if logger == nil {
 		logger = logs.NewLogger()
 	}
-	w := bufio.NewWriter(netStream)
+	w := ggio.NewDelimitedWriter(netStream)
 	rc := ggio.NewDelimitedReader(netStream, defaultMaxPacketMsgSize)
 
 	dc := &DefaultConn{
 		peer:          peer,
 		stream:        netStream,
-		send:          make(chan struct{}, 1),
-		flushTicker:   time.NewTicker(defaultFlushTicker),
+		send:          make(chan int32, 1),
 		quit:          make(chan struct{}, 1),
 		channels:      make([]*Channel, 0),
 		channelsIdx:   make(map[int32]*Channel),
@@ -94,8 +90,6 @@ func (dc *DefaultConn) Start() {
 }
 
 func (dc *DefaultConn) Send(chID int32, msgBytes []byte) bool {
-	dc.log.Info("send @ conn.Send, channel: %d, peer_id: %s, msgBytes: %+v", chID, dc.peer.ID(), fmt.Sprintf("%X", msgBytes))
-
 	// Send message to channel.
 	channel, ok := dc.channelsIdx[chID]
 	if !ok {
@@ -107,17 +101,14 @@ func (dc *DefaultConn) Send(chID int32, msgBytes []byte) bool {
 	if success {
 		// Wake up sendRoutine if necessary
 		select {
-		case dc.send <- struct{}{}:
+		case dc.send <- chID:
 		default:
 		}
-	} else {
-		dc.log.Error("send failed @ conn.Send, channel :%d, peer_id: %s", chID, dc.peer.ID())
+		return success
 	}
-	return success
-}
 
-func (dc *DefaultConn) IsRunning() bool {
-	return true
+	dc.log.Error("send fail, queue timeout @ conn.Send, channel :%d, peer_id: %s", chID, dc.peer.ID())
+	return success
 }
 
 // FlushStop replicates the logic of OnStop.
@@ -132,126 +123,97 @@ func (dc *DefaultConn) FlushStop() {
 	// Send and flush all pending msgs.
 	// Since sendRoutine has exited, we can call this
 	// safely
-	eof := dc.sendMsg()
-	for !eof {
-		eof = dc.sendMsg()
+	for _, channel := range dc.channels {
+		dc.sendMsg(channel.id)
 	}
-	dc.flush()
 
 	// Now we can close the connection
-
 	dc.stream.Close()
+	close(dc.send)
+	close(dc.quit)
 }
 
 func (dc *DefaultConn) sendRoutine() {
 LOOP:
-	for {
-		select {
-		case <-dc.flushTicker.C:
-			dc.flush()
-		case <-dc.send:
-			// send some msgs
-			eof := dc.sendMsg()
-			if !eof {
-				// Keep sendRoutine awake.
-				select {
-				case dc.send <- struct{}{}:
-				default:
-				}
-			}
-		}
-		if !dc.IsRunning() {
-			break LOOP
-		}
+	select {
+	case ch := <-dc.send:
+		// send some msgs
+		dc.sendMsg(ch)
+		goto LOOP
+	case <-dc.quit:
+		break LOOP
 	}
-	// Cleanup
-	close(dc.quit)
 }
 
-func (dc *DefaultConn) sendMsg() bool {
-	if len(dc.channels) == 0 {
-		return false
+func (dc *DefaultConn) sendMsg(chID int32) bool {
+	channel, ok := dc.channelsIdx[chID]
+	if !ok {
+		dc.log.Error("cannot sendMsg, unknown channel @ conn.Send, channel: %d", chID)
+		return true
 	}
-	for _, channel := range dc.channels {
-		// If nothing to send, skip this channel
-		if !channel.isSendPending() {
-			continue
-		}
-		if err := channel.writeMsgTo(dc.bufConnWriter); err != nil {
-			dc.log.Error("failed to write @ sendMsg, channel_id: %d, err: %v", channel.id, err)
-			continue
-		}
+	// If nothing to send, skip this channel
+	if !channel.isSendPending() {
+		return true
 	}
-	return true
+	if err := channel.writeMsgTo(); err != nil {
+		dc.log.Error("failed to write @ sendMsg, channel_id: %d, err: %v", channel.id, err)
+		return true
+	}
+	return false
 }
 
+// TODO: stream reset
 func (dc *DefaultConn) recvRoutine() {
 	for {
 		var packet pb.Packet
-		err := dc.reader.ReadMsg(&packet)
-		if err != nil {
-			// stopServices was invoked and we are shutting down
-			// receiving is excpected to fail since we will close the connection
-			select {
-			case <-dc.quit:
-				dc.log.Error("meet quit @ recvRoutine, peer_id: %d, err: %v", dc.peer.ID(), err)
-				break
-			default:
-			}
-			if dc.IsRunning() {
+
+		select {
+		case <-dc.quit:
+			dc.log.Error("meet quit @ recvRoutine, peer_id: %d", dc.peer.ID())
+			return
+		default:
+			err := dc.reader.ReadMsg(&packet)
+			if err != nil {
+				// stopServices was invoked and we are shutting down
+				// receiving is excpected to fail since we will close the connection
 				if err == io.EOF {
 					dc.log.Info("connection meets EOF @ recvRoutine (likely by the other side), peer_id: %d", dc.peer.ID())
-					break
+					continue
 				}
-				dc.log.Error("connection failed @ recvRoutine (reading byte), peer_id: %d, err: %v", dc.peer.ID(), err)
+				dc.log.Error("connection failed @ recvRoutine (reading byte), peer_id: %s, err: %v", dc.peer.ID(), err)
+				return
 			}
-			break
-		}
-
-		// Read more depending on packet type.
-		switch pkt := packet.Sum.(type) {
-		case *pb.Packet_PacketMsg:
-			cid := pkt.PacketMsg.ChannelId
-			channel, ok := dc.channelsIdx[cid]
-			if !ok || channel == nil {
-				dc.log.Error("cannot find valid channel @ recvRoutine, peer_id: %d, err: %v",
-					dc.peer.ID(), fmt.Errorf("unknown channel %d", cid))
-				break
-			}
-
-			msgBytes, err := channel.recvMsg(pkt.PacketMsg)
-			if err != nil {
-				if dc.IsRunning() {
-					dc.log.Error("channel recvMsg failed @ recvRoutine, peer_id: %s, channel_id: %d, err: %v",
-						dc.peer.ID(), cid, err)
-				}
-				break
-			}
-
-			module := pkt.PacketMsg.Module
-			onReceive, ok := dc.onReceiveIdx[Module(module)]
-			if !ok {
-				dc.log.Error("cannot find valid module @ recvRoutine, peer_id: %d, err: %v",
-					dc.peer.ID(), fmt.Errorf("unknown module %s", module))
-				break
-			}
-
-			if msgBytes != nil {
-				dc.log.Debug("received bytes, channel: %d, msgBytes: %+v", pkt.PacketMsg.ChannelId, fmt.Sprintf("%X", msgBytes))
-				onReceive.HandleFunc(cid, msgBytes)
-			}
-		default:
-			dc.log.Error("connection failed @ recvRoutine6, peer_id: %d, err: %v",
-				dc.peer.ID(), fmt.Errorf("unknown message type %v", reflect.TypeOf(&packet)))
-			continue
+			go dc.handlePkt(packet)
 		}
 	}
 }
 
-func (dc *DefaultConn) flush() {
-	err := dc.bufConnWriter.Flush()
-	if err != nil {
-		dc.log.Error("flush failed @ Conn.flush, err: %v", err)
+func (dc *DefaultConn) handlePkt(packet pb.Packet) {
+	// Read more depending on packet type.
+	switch pkt := packet.Sum.(type) {
+	case *pb.Packet_PacketMsg:
+		cid := pkt.PacketMsg.ChannelId
+		channel, ok := dc.channelsIdx[cid]
+		if !ok || channel == nil {
+			dc.log.Error("cannot find valid channel @ recvRoutine, peer_id: %d, err: %v",
+				dc.peer.ID(), fmt.Errorf("unknown channel %d", cid))
+			return
+		}
+		module := pkt.PacketMsg.Module
+		onReceive, ok := dc.onReceiveIdx[Module(module)]
+		if !ok {
+			dc.log.Error("cannot find valid module @ recvRoutine, peer_id: %d, err: %v",
+				dc.peer.ID(), fmt.Errorf("unknown module %s", module))
+			return
+		}
+		if pkt.PacketMsg.Data != nil {
+			dc.log.Debug("received bytes, channel: %d, packet: %+v", pkt.PacketMsg.ChannelId, pkt.PacketMsg)
+			onReceive.HandleFunc(cid, pkt.PacketMsg.Data)
+		}
+	default:
+		dc.log.Error("connection failed @ recvRoutine, peer_id: %s, err: %v",
+			dc.peer.ID(), fmt.Errorf("unknown message type %v", reflect.TypeOf(&packet)))
+		return
 	}
 }
 
@@ -292,10 +254,19 @@ func (ch *Channel) sendBytes(bytes []byte) bool {
 	}
 }
 
-func (ch *Channel) writeMsgTo(w io.Writer) error {
-	writer := ggio.NewDelimitedWriter(w)
+func (ch *Channel) writeMsgTo() error {
+	module, ok := libs.IDToModuleMap[ch.id]
+	if !ok {
+		return fmt.Errorf("channel id invalid, id: %d", ch.id)
+	}
+	id, err := libs.GenRandomID()
+	if err != nil {
+		return err
+	}
 	packetMsg := &pb.PacketMsg{
+		LogId:     fmt.Sprintf("%d", id),
 		ChannelId: ch.id,
+		Module:    module,
 		Eof:       true,
 		Data:      ch.sending,
 	}
@@ -304,18 +275,10 @@ func (ch *Channel) writeMsgTo(w io.Writer) error {
 			PacketMsg: packetMsg,
 		},
 	}
-	err := writer.WriteMsg(packet)
-	return err
-}
 
-func (ch *Channel) recvMsg(msg *pb.PacketMsg) ([]byte, error) {
-	ch.recving = append(ch.recving, msg.Data...)
-	if msg.Eof {
-		msgBytes := ch.recving
-		ch.recving = ch.recving[:0] // make([]byte, 0, ch.desc.RecvBufferCapacity)
-		return msgBytes, nil
-	}
-	return nil, nil
+	err = ch.conn.bufConnWriter.WriteMsg(packet)
+	ch.log.Error("send succ @ conn.Send, channel: %d, to: %s, pkg :%+v, err: %v", ch.id, ch.conn.peer.ID(), packet.String(), err)
+	return err
 }
 
 // Returns true if any PacketMsgs are pending to be sent.

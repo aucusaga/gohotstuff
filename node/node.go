@@ -1,6 +1,9 @@
 package node
 
 import (
+	"io/ioutil"
+	"path/filepath"
+
 	"github.com/astaxie/beego/logs"
 	"github.com/aucusaga/gohotstuff/crypto"
 	"github.com/aucusaga/gohotstuff/libs"
@@ -10,7 +13,7 @@ import (
 
 // node is the canonical implementation of the replica
 type Node struct {
-	cfg *Config
+	cfg *NodeConfig
 
 	p2p *p2p.Switch
 	smr *state.State
@@ -39,23 +42,66 @@ func createP2P(cfg *p2p.Config, consensusReactor libs.Reactor, logger libs.Logge
 	return sw, nil
 }
 
-func NewNode(config *Config) (*Node, error) {
+func NewNode(config *libs.Config) (*Node, error) {
 	logger := logs.NewLogger()
 
+	// load netkeys
+	netPath := filepath.Join("./conf", config.Netpath)
+	netPriKey, err := ioutil.ReadFile(filepath.Join(netPath, "private.key"))
+	if err != nil {
+		logger.Warn("load private key err, err: %+v", err)
+		panic("cannot get private key")
+	}
+
+	// TODO: loading WAL instead of configuration
+	var startValidators []state.PeerID
+	for _, v := range config.Validators {
+		startValidators = append(startValidators, state.PeerID(v))
+	}
+	cfg := &NodeConfig{
+		name: config.Host,
+		p2p: &p2p.Config{
+			BootStrap:  config.Bootstrap,
+			Address:    config.Address,
+			PrivateKey: string(netPriKey),
+		},
+		state: &state.ConsensusConfig{
+			StartRound:      int64(config.Round),
+			StartID:         config.Startk,
+			StartValue:      []byte(config.Startv),
+			StartValidators: startValidators,
+		},
+	}
+
+	// load crypto keys
+	keypath := filepath.Join("./conf", config.Keypath)
+	priKey, err := ioutil.ReadFile(filepath.Join(keypath, "private.key"))
+	if err != nil {
+		logger.Warn("load private key err, err: %+v", err)
+		panic("cannot get private key")
+	}
+
+	err = crypto.InitCryptoClient(priKey)
+	if err != nil {
+		logger.Warn("init crypto client err, err: %+v", err)
+		panic("init crypto client failed")
+	}
 	cc := crypto.CryptoClientPicker()
 
-	cons, err := createConsensus(config.name, cc, config.state, logger)
+	cons, err := createConsensus(cfg.name, cc, cfg.state, logger)
 	if err != nil {
+		logger.Warn("create consensus err, err: %+v", err)
 		return nil, err
 	}
 
-	sw, err := createP2P(config.p2p, cons, logger)
+	sw, err := createP2P(cfg.p2p, cons, logger)
 	if err != nil {
+		logger.Warn("create p2p err, err: %+v", err)
 		return nil, err
 	}
 
 	return &Node{
-		cfg: config,
+		cfg: cfg,
 		p2p: sw,
 		smr: cons,
 		cc:  cc,
@@ -63,11 +109,12 @@ func NewNode(config *Config) (*Node, error) {
 }
 
 func (n *Node) Start() {
-
+	go n.p2p.Start()
+	go n.smr.Start()
 }
 
 //-----------------------------------------
-type Config struct {
+type NodeConfig struct {
 	name  string
 	p2p   *p2p.Config
 	state *state.ConsensusConfig

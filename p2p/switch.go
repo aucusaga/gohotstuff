@@ -27,7 +27,7 @@ const (
 )
 
 var (
-	defaultTickerTimeSec = 5
+	defaultTickerTimeSec = 4
 )
 
 type Switch struct {
@@ -50,16 +50,19 @@ func NewSwitch(cfg *Config, logger libs.Logger) (*Switch, error) {
 	if cfg.TickerTimeSec == 0 {
 		cfg.TickerTimeSec = int64(defaultTickerTimeSec)
 	}
-	sw := &Switch{
-		quit:  make(chan struct{}),
-		cfg:   cfg,
-		peers: NewPeerSet(),
-		timer: time.NewTicker(time.Duration(cfg.TickerTimeSec) * time.Second),
-	}
-	sw.log = logger
 	if logger == nil {
-		sw.log = logs.NewLogger()
+		logger = logs.NewLogger()
 	}
+	sw := &Switch{
+		quit:    make(chan struct{}),
+		cfg:     cfg,
+		peers:   NewPeerSet(),
+		timer:   time.NewTicker(time.Duration(cfg.TickerTimeSec) * time.Second),
+		reactor: make(map[Module]libs.Reactor),
+		log:     logger,
+	}
+
+	sw.log.Info("new a switch succ, cfg: %+v", cfg)
 	return sw, nil
 }
 
@@ -69,11 +72,12 @@ func (sw *Switch) AddReactor(mo Module, f libs.Reactor) error {
 	sw.mtx.Lock()
 	defer sw.mtx.Unlock()
 
-	if _, ok := sw.reactor[mo]; !ok {
+	if _, ok := sw.reactor[mo]; ok {
 		return fmt.Errorf("module has been registered before, %v", mo)
 	}
 
 	sw.reactor[mo] = f
+	sw.log.Info("[module %s] registered", mo)
 	return nil
 }
 
@@ -123,7 +127,7 @@ func (sw *Switch) Start() error {
 		return err
 	}
 
-	sw.acceptRoutine()
+	go sw.acceptRoutine()
 
 	return nil
 }
@@ -163,10 +167,12 @@ func (sw *Switch) Broadcast(chID int32, msgBytes []byte) {
 func (sw *Switch) Send(peer string, chID int32, msgBytes []byte) error {
 	p, err := sw.peers.Find(PeerID(peer))
 	if err != nil {
-		sw.log.Error("fail to send @ Send, err: %v, peer_id: %v, chID: %d, msgBytes: %X", err, peer, chID, msgBytes)
+		sw.log.Error("fail to find peer @ Send, err: %v, peer_id: %v, chID: %d, msgBytes: %X", err, peer, chID, msgBytes)
 		return err
 	}
-	p.Send(chID, msgBytes)
+	if !p.Send(chID, msgBytes) {
+		return fmt.Errorf("fail to send @ Send, err: %v, peer_id: %v, chID: %d, msgBytes: %X", err, peer, chID, msgBytes)
+	}
 	return nil
 }
 
@@ -176,7 +182,10 @@ func (sw *Switch) GetP2PID(peerID string) (string, error) {
 
 func (sw *Switch) genPeerMultiID(id peer.ID) string {
 	peer := sw.host.Peerstore().PeerInfo(id)
-	return fmt.Sprintf("%s/%s", peer.Addrs[0], peer.ID)
+	if len(peer.Addrs) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s/p2p/%s", peer.Addrs[0], peer.ID)
 }
 
 func (sw *Switch) bootstrap(ctx context.Context) error {
@@ -185,28 +194,16 @@ func (sw *Switch) bootstrap(ctx context.Context) error {
 		return err
 	}
 
+retry:
 	for _, peerMutltiID := range sw.cfg.BootStrap {
-		peerAddr, err := ipfsaddr.ParseString(peerMutltiID)
-		if err != nil {
-			sw.log.Error("parse string failed @ p2p.bootstrap, peer: %s, err: %v", peerMutltiID, err)
+		if err := sw.connect(peerMutltiID); err != nil {
 			continue
 		}
-		addrInfo, err := peer.AddrInfoFromP2pAddr(peerAddr.Multiaddr())
-		if err != nil {
-			sw.log.Error("add addrinfo failed @ p2p.bootstrap, err: %v", err)
-			continue
-		}
-		if err := sw.host.Connect(ctx, *addrInfo); err != nil {
-			sw.log.Error("connect failed @ p2p.bootstrap, err: %v, addrinfo: %+v", err, *addrInfo)
-			continue
-		}
+		sw.log.Info("build stream success @ bootstrap remote_peer: %s", peerMutltiID)
 	}
 
-	for _, peerID := range sw.kdht.RoutingTable().ListPeers() {
-		if err := sw.dialPeersAsync(peerID); err != nil {
-			sw.log.Error("dail fail @ bootstrap peer_id: %s, err: %v", peerID, err)
-		}
-		sw.log.Info("build stream success @ bootstrap remote_peer: %s", peerID)
+	if len(sw.kdht.RoutingTable().ListPeers()) == 0 {
+		goto retry
 	}
 
 	return nil
@@ -218,6 +215,12 @@ func (sw *Switch) bootstrap(ctx context.Context) error {
 // encounter is returned.
 // Nop if there are no peers.
 func (sw *Switch) dialPeersAsync(id peer.ID) error {
+	old, err := sw.peers.Find(PeerID(id.Pretty()))
+	if err == nil {
+		if err := old.Validate(); err == nil {
+			return nil
+		}
+	}
 	ctx := context.Background()
 	stream, err := sw.host.NewStream(ctx, id, protocol.ID(protocolPrefix))
 	if err != nil {
@@ -228,6 +231,8 @@ func (sw *Switch) dialPeersAsync(id peer.ID) error {
 	peer, err := NewDefaultPeer(&rawPeer, stream, sw.reactor, sw.log)
 	if err != nil {
 		sw.log.Error("new remote peer fail @ DialPeersAsync, peer_id: %s, err: %v", id.Pretty(), err)
+		stream.Close()
+		sw.kdht.RoutingTable().RemovePeer(id)
 		return err
 	}
 	sw.peers.Add(peer)
@@ -240,17 +245,48 @@ func (sw *Switch) acceptRoutine() {
 		select {
 		case <-sw.timer.C:
 			for _, peerID := range sw.kdht.RoutingTable().ListPeers() {
-				sw.log.Info("routing table range @ acceptRoutine, peer_multi: %s", sw.genPeerMultiID(peerID))
+				if _, err := sw.peers.Find(PeerID(peerID)); err == nil {
+					continue
+				}
+				multiAddr := sw.genPeerMultiID(peerID)
+				if multiAddr == "" {
+					continue
+				}
+				if err := sw.connect(multiAddr); err != nil {
+					continue
+				}
+				sw.log.Info("connect peer from router table @ p2p.acceptRoutine, peer_id: %s", peerID.Pretty())
 			}
 		case <-sw.quit:
-			sw.log.Error("switch meets end @ acceptRoutine, return")
+			sw.log.Error("switch meets end @ p2p.acceptRoutine, return")
 			return
 		}
 	}
 }
 
+func (sw *Switch) connect(multiAddr string) error {
+	peerAddr, err := ipfsaddr.ParseString(multiAddr)
+	if err != nil {
+		sw.log.Error("parse string failed @ p2p.acceptRoutine, multi_peer: %s, err: %v", multiAddr, err)
+		return err
+	}
+	addrInfo, err := peer.AddrInfoFromP2pAddr(peerAddr.Multiaddr())
+	if err != nil {
+		sw.log.Error("add addrinfo failed @ p2p.acceptRoutine, multi_peer: %s, err: %v", multiAddr, err)
+		return err
+	}
+	if err := sw.host.Connect(context.Background(), *addrInfo); err != nil {
+		sw.log.Error("host connect failed @ p2p.acceptRoutine, peer_id: %s, err: %v", addrInfo.ID.Pretty(), err)
+		return err
+	}
+	if err := sw.dialPeersAsync(addrInfo.ID); err != nil {
+		sw.log.Error("dial fail @ p2p.acceptRoutine peer_id: %s, err: %v", addrInfo.ID.Pretty(), err)
+	}
+	return nil
+}
+
 func (sw *Switch) handleStream(netStream network.Stream) {
-	old, err := sw.peers.Find(PeerID(netStream.Conn().RemotePeer()))
+	old, err := sw.peers.Find(PeerID(netStream.Conn().RemotePeer().Pretty()))
 	if err == nil {
 		if err := old.Validate(); err == nil {
 			sw.log.Error("use an old one @ handleStream, peer_id: %s", netStream.Conn().RemotePeer())
@@ -272,8 +308,8 @@ func (sw *Switch) handleStream(netStream network.Stream) {
 type Config struct {
 	Address    string
 	BootStrap  []string
-	PrivateKey []byte // only for networking
-	PublicKey  []byte // only for networking
+	PrivateKey string // only for networking
+	PublicKey  string // only for networking
 
 	TickerTimeSec int64
 }

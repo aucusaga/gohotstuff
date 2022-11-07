@@ -4,10 +4,11 @@ package gohotstuff.pb;
 option go_package = ".;pb";
 
 message PacketMsg {
-  int32 channel_id = 1;
-  string module    = 2;
-  bool  eof        = 3;
-  bytes data       = 4;
+  string log_id    = 1;
+  int32 channel_id = 2;
+  string module    = 3;
+  bool  eof        = 4;
+  bytes data       = 5;
 }
 
 message Packet {

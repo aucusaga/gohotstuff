@@ -27,7 +27,7 @@ type CryptoClient interface {
 // RegisterCryptoClient registers a crypto client initialization function.
 func RegisterCryptoClient(fn func() CryptoClient) {
 	if CryptoClientPicker != nil {
-		panic("RegisterCryptoClient called more than once")
+		CryptoClientPicker = nil
 	}
 	CryptoClientPicker = func() CryptoClient {
 		return fn()

@@ -11,18 +11,18 @@ type QuorumCert interface {
 	ParentProposal() (round int64, id []byte, err error)
 	Sender() (senderID string)
 	Signatures(peerID string) (signType int, sign []byte, pk []byte, err error)
-	Serialize() []byte
+	Serialize() ([]byte, error)
 }
 
 // DefaultQuorumCert is the canonical implementation of the QuorumCert interface
 type DefaultQuorumCert struct {
-	Round       int64
-	ID          []byte
-	ParentRound int64
-	ParentID    []byte
-	SenderID    string
+	Round       int64  `json:"round"`
+	ID          []byte `json:"id"`
+	ParentRound int64  `json:"parent_round"`
+	ParentID    []byte `json:"parent_round"`
+	SenderID    string `json:"sender"`
 
-	Signs map[string]DefaultSign
+	Signs map[string]DefaultSign `json:"signs"`
 	// lastCommitID []byte
 }
 
@@ -68,8 +68,8 @@ func (qc DefaultQuorumCert) Signatures(peerID string) (int, []byte, []byte, erro
 	return sign.Type, sign.Sign, sign.PublicKey, nil
 }
 
-func (qc DefaultQuorumCert) Serialize() []byte {
-	return nil
+func (qc DefaultQuorumCert) Serialize() ([]byte, error) {
+	return json.Marshal(qc)
 }
 
 type DefaultSign struct {

@@ -10,6 +10,8 @@ import (
 const (
 	TypeCollectVotes = 1 // "collect_votes_type"
 	TypeNextRound    = 2 // "next_round_type"
+
+	MaxTimeoutSec = 60 * 60
 )
 
 var (
@@ -19,6 +21,7 @@ var (
 // TimeoutTicker is a timer that schedules timeouts
 // conditional on the height/round/step in the timeoutInfo.
 type TimeoutTicker interface {
+	Start()
 	Stop()
 	Chan() <-chan timeoutInfo       // on which to receive a timeout
 	ScheduleTimeout(ti timeoutInfo) // reset the timer
@@ -47,13 +50,16 @@ func NewDefaultTimeoutTicker(logger libs.Logger) TimeoutTicker {
 		logger = logs.NewLogger()
 	}
 	tt := &DefaultTimeoutTicker{
-		timer:    time.NewTimer(0),
+		timer:    time.NewTimer(MaxTimeoutSec * time.Second),
 		tickChan: make(chan timeoutInfo, tickTockBufferSize),
 		tockChan: make(chan timeoutInfo, tickTockBufferSize),
 		log:      logger,
 	}
-	go tt.timeoutRoutine()
 	return tt
+}
+
+func (t *DefaultTimeoutTicker) Start() {
+	go t.timeoutRoutine()
 }
 
 // ScheduleTimeout schedules a new timeout by sending on the internal tickChan.
@@ -61,6 +67,7 @@ func NewDefaultTimeoutTicker(logger libs.Logger) TimeoutTicker {
 // The scheduling may fail if the timeoutRoutine has already scheduled a timeout for a later height/round/step.
 func (t *DefaultTimeoutTicker) ScheduleTimeout(ti timeoutInfo) {
 	t.tickChan <- ti
+	t.log.Info("new timeout info: %+v", ti)
 }
 
 // Chan returns a channel on which timeouts are sent.
@@ -84,7 +91,7 @@ func (t *DefaultTimeoutTicker) timeoutRoutine() {
 	for {
 		select {
 		case newti := <-t.tickChan:
-			t.log.Info("Received tick", "old_ti", ti, "new_ti", newti)
+			t.log.Info("Received tick, old timeout info: %+v, new_ti: %+v", ti, newti)
 
 			// ignore tickers for old round
 			if newti.Round < ti.Round {
@@ -92,14 +99,12 @@ func (t *DefaultTimeoutTicker) timeoutRoutine() {
 			}
 
 			t.timer.Stop()
-
 			// update timeoutInfo and reset timer
 			// NOTE time.Timer allows duration to be non-positive
+			t.timer.Reset(newti.Duration)
 			ti = newti
-			t.timer.Reset(ti.Duration)
-			t.log.Info("Scheduled timeout", "dur", ti.Duration, "round", ti.Round)
 		case <-t.timer.C:
-			t.log.Info("Timed out", "dur", ti.Duration, "round", ti.Round)
+			t.log.Info("Timed out, dur: %+v, round: %+v", ti.Duration, ti.Round)
 			// go routine here guarantees timeoutRoutine doesn't block.
 			// Determinism comes from playback in the receiveRoutine.
 			// We can eliminate it by merging the timeoutRoutine into receiveRoutine

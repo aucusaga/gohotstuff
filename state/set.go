@@ -1,205 +1,202 @@
 package state
 
 import (
-	"bytes"
-	"fmt"
+	"sync"
+
+	"github.com/aucusaga/gohotstuff/libs"
 )
 
 type VoteSet struct {
-	MaxIndex      int64                   // for timeout set
-	maxRound      int64                   // for vote set
-	roundVoteSets map[int64]*RoundVoteSet // map[round] for vote set, map[index] for timeout set
+	latestRound   int64                             // for vote set
+	latestID      []byte                            // for vote set
+	roundVoteSets map[int64]map[string]RoundVoteSet // map[round][proposal_id]RoundVoteSet for vote set
+	mtx           sync.Mutex
 }
 
 type RoundVoteSet struct {
-	idx        int64
 	round      int64
 	id         []byte
 	count      map[PeerID]struct{}
 	validators map[PeerID]struct{}
 }
 
+// TODO: load from wal
 func NewVoteSet(rootRound int64) *VoteSet {
-	return &VoteSet{
-		maxRound:      rootRound,
-		roundVoteSets: make(map[int64]*RoundVoteSet),
+	rootRoundMap := make(map[string]RoundVoteSet)
+	set := &VoteSet{
+		latestRound:   rootRound,
+		roundVoteSets: make(map[int64]map[string]RoundVoteSet),
 	}
+	set.roundVoteSets[rootRound] = rootRoundMap
+	return set
+}
+
+func (s *VoteSet) AddVote(round int64, id []byte, sender PeerID, validators []PeerID) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	if _, ok := s.roundVoteSets[round]; !ok {
+		roundMap := make(map[string]RoundVoteSet)
+		s.roundVoteSets[round] = roundMap
+	}
+	if _, ok := s.roundVoteSets[round][string(id)]; !ok {
+		rs := RoundVoteSet{
+			round:      round,
+			id:         id,
+			count:      make(map[PeerID]struct{}),
+			validators: make(map[PeerID]struct{}),
+		}
+		s.roundVoteSets[round][string(id)] = rs
+	}
+	if validators != nil {
+		for _, peer := range validators {
+			s.roundVoteSets[round][string(id)].validators[peer] = struct{}{}
+		}
+	}
+	// has inserted before
+	if _, ok := s.roundVoteSets[round][string(id)].count[sender]; ok {
+		return nil
+	}
+	s.roundVoteSets[round][string(id)].count[sender] = struct{}{}
+	if s.latestRound <= round {
+		s.latestRound = round
+		s.latestID = id
+	}
+	return nil
+}
+
+func (s *VoteSet) HasTwoThirdsAny(round int64, id []byte) bool {
+	set := s.roundVoteSets[round][string(id)]
+	lens := 0
+	for peer := range set.count {
+		if _, ok := set.validators[peer]; ok {
+			lens++
+		}
+	}
+	threshold := lens > len(set.validators)*2/3
+	if threshold {
+		s.reset(round, id)
+	}
+	return threshold
+}
+
+// Reset clean up the set storage.
+// Now round is the highQC.
+func (s *VoteSet) reset(round int64, id []byte) error {
+	for pround, _ := range s.roundVoteSets {
+		if pround <= round-libs.HotstuffChaindStep {
+			delete(s.roundVoteSets, pround)
+		}
+	}
+	return nil
+}
+
+type TimeoutSet struct {
+	latestRound        int64                               // for vote set
+	latestTimeoutIndex int64                               // for timeout set
+	timeoutSets        map[int64]map[int64]RoundTimeoutSet // map[round][timeoutidx]TimeoutSet for timeout set
+	mtx                sync.Mutex
+}
+
+type RoundTimeoutSet struct {
+	round      int64
+	index      int64
+	count      map[PeerID]struct{}
+	validators map[PeerID]struct{}
+}
+
+// TODO: load from wal
+func NewTimeoutSet(rootRound int64, latestTimeoutIndex int64) *TimeoutSet {
+	set := &TimeoutSet{
+		latestRound:        rootRound,
+		latestTimeoutIndex: latestTimeoutIndex,
+		timeoutSets:        make(map[int64]map[int64]RoundTimeoutSet),
+	}
+	item := make(map[int64]RoundTimeoutSet)
+	item[latestTimeoutIndex] = RoundTimeoutSet{
+		round:      rootRound,
+		index:      latestTimeoutIndex,
+		count:      make(map[PeerID]struct{}),
+		validators: make(map[PeerID]struct{}),
+	}
+	set.timeoutSets[rootRound] = item
+	return set
 }
 
 // when the rollback strategy is loaded, timeout round can be similar with the previous timeout round
 // (see a timeout round a of the leader a has came out, the system will rollback and rebuild round a which leader may be leader a too),
 // so we use index flag to make timeout unique among the others.
-func (v *VoteSet) AddRoundVoteSet(round int64, validators []PeerID, id []byte, idx int64) error {
-	if v.maxRound > round {
-		return fmt.Errorf("invalid round, maxRound: %d, round: %d", v.maxRound, round)
-	}
+func (s *TimeoutSet) AddTimeout(round int64, idx int64, sender PeerID, validators []PeerID) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
 
-	// for vote set
-	if id != nil {
-		if set, ok := v.roundVoteSets[round]; ok {
-			if bytes.Equal(set.id, id) {
-				return nil
-			}
-			// need reset
-			return ErrVoteSetOccupied
-		}
-		// init new vote set for the round
-		val := make(map[PeerID]struct{})
-		for _, peer := range validators {
-			val[peer] = struct{}{}
-		}
-		v.roundVoteSets[round] = &RoundVoteSet{
-			idx:        -1,
+	if _, ok := s.timeoutSets[round]; !ok {
+		item := make(map[int64]RoundTimeoutSet)
+		s.timeoutSets[round] = item
+	}
+	if _, ok := s.timeoutSets[round][idx]; !ok {
+		set := RoundTimeoutSet{
 			round:      round,
-			id:         id,
+			index:      idx,
 			count:      make(map[PeerID]struct{}),
-			validators: val,
+			validators: make(map[PeerID]struct{}),
 		}
+		s.timeoutSets[round][idx] = set
+	}
+	if validators != nil {
+		for _, peer := range validators {
+			s.timeoutSets[round][idx].validators[peer] = struct{}{}
+		}
+	}
+	// has inserted before
+	if _, ok := s.timeoutSets[round][idx].count[sender]; ok {
 		return nil
 	}
 
-	// for timeout set
-	set, ok := v.roundVoteSets[idx]
-	if ok {
-		if len(set.validators) != len(validators) {
-			return fmt.Errorf("invalid validators in timeout.%d, want: %+v, have: %+v", idx, set.validators, validators)
-		}
-		for _, peer := range validators {
-			if _, ok := set.validators[peer]; !ok {
-				return fmt.Errorf("different validators in timeout.%d, want: %+v, have: %+v", idx, set.validators, validators)
-			}
-		}
+	s.timeoutSets[round][idx].count[sender] = struct{}{}
+	if round > s.latestRound {
+		s.latestRound = round
+		s.latestTimeoutIndex = idx
 		return nil
 	}
-	// init
-	val := make(map[PeerID]struct{})
-	for _, peer := range validators {
-		val[peer] = struct{}{}
-	}
-	v.roundVoteSets[idx] = &RoundVoteSet{
-		idx:        idx,
-		round:      round,
-		id:         nil,
-		count:      make(map[PeerID]struct{}),
-		validators: val,
+	if round == s.latestRound && idx > s.latestTimeoutIndex {
+		s.latestTimeoutIndex = idx
 	}
 	return nil
 }
 
-func (v *VoteSet) Reset(round int64, validators []PeerID, id []byte, idx int64) error {
-	// for vote set
-	if id != nil {
-		set, ok := v.roundVoteSets[round]
-		if !ok {
-			return v.AddRoundVoteSet(round, validators, id, -1)
-		}
-		set.id = id
-		for pi := range set.count {
-			delete(set.count, pi)
-		}
-		for pi := range set.validators {
-			delete(set.validators, pi)
-		}
-		for _, peer := range validators {
-			set.validators[peer] = struct{}{}
-		}
-		return nil
-	}
+func (s *TimeoutSet) HasTwoThirdsAny(round int64, idx int64) bool {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
 
-	// for timeout reset
-	if idx == v.MaxIndex {
-		set, ok := v.roundVoteSets[idx]
-		if !ok {
-			goto new
-		}
-		if set.round != round {
-			return fmt.Errorf("invalid round, idx: %d, want_round: %d, have_round: %d,", idx, set.round, round)
-		}
-		return nil
-	}
-	if idx != v.MaxIndex+1 {
-		return fmt.Errorf("invalid index, max_index: %d, index: %d", v.MaxIndex, idx)
-	}
-new:
-	v.MaxIndex = idx
-	if validators == nil {
-		return nil
-	}
-	return v.AddRoundVoteSet(round, validators, nil, v.MaxIndex)
-}
-
-func (v *VoteSet) AddVote(round int64, validator PeerID, id []byte, idx int64) error {
-	// for vote set
-	if id != nil {
-		set, ok := v.roundVoteSets[round]
-		if !ok {
-			return fmt.Errorf("invalid round")
-		}
-		if !bytes.Equal(set.id, id) {
-			return ErrVoteSetOccupied
-		}
-		set.count[validator] = struct{}{}
-		return nil
-	}
-
-	// for timeout set
-	set, ok := v.roundVoteSets[idx]
-	if !ok {
-		return fmt.Errorf("invalid index")
-	}
-	if set.idx != idx || set.round != round {
-		return fmt.Errorf("invalid index or round, want_index: %d, have_index: %d, want_round: %d, have_round: %d,", set.idx, idx, set.round, round)
-	}
-	set.count[validator] = struct{}{}
-	return nil
-}
-
-func (v *VoteSet) LoadVote(round int64, validator PeerID, id []byte, idx int64) bool {
-	if id != nil {
-		if set, ok := v.roundVoteSets[round]; ok {
-			if bytes.Equal(set.id, id) {
-				if _, ok := set.count[validator]; ok {
-					return true
-				}
-			}
-		}
-		return false
-	}
-	if set, ok := v.roundVoteSets[idx]; ok {
-		if set.round == round {
-			if _, ok := set.count[validator]; ok {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (v *VoteSet) HasTwoThirdsAny(round int64, id []byte, idx int64) bool {
-	var set *RoundVoteSet
-	var ok bool
-	if id != nil {
-		set, ok = v.roundVoteSets[round]
-		if !ok {
-			return false
-		}
-		if !bytes.Equal(set.id, id) {
-			return false
-		}
-	} else {
-		set, ok = v.roundVoteSets[idx]
-		if !ok {
-			return false
-		}
-		if set.idx != idx || set.round != round {
-			return false
-		}
-	}
+	set := s.timeoutSets[round][idx]
 	lens := 0
-	for peer, _ := range set.count {
+	for peer := range set.count {
 		if _, ok := set.validators[peer]; ok {
 			lens++
 		}
 	}
 	return lens > len(set.validators)*2/3
+}
+
+func (s *TimeoutSet) GetCurrentTimeoutIndex() int64 {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	return s.latestTimeoutIndex
+}
+
+func (s *TimeoutSet) Reset(round int64, idx int64) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	if round > s.latestRound {
+		s.latestRound = round
+		s.latestTimeoutIndex = idx
+		return nil
+	}
+	if round == s.latestRound && idx > s.latestTimeoutIndex {
+		s.latestTimeoutIndex = idx
+	}
+	return nil
 }

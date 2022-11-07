@@ -1,0 +1,36 @@
+#p2p
+host: "Qmf2HeHe4sspGkfRCTq6257Vm3UHzvh2TeQJHHvHzzuFw6"
+# address multiaddr string
+address: /ip4/127.0.0.1/tcp/30001
+# bootstrap config the bootNodes the node to connect
+bootstrap:
+# - "/ip4/127.0.0.1/tcp/30001/p2p/Qmf2HeHe4sspGkfRCTq6257Vm3UHzvh2TeQJHHvHzzuFw6"
+# - "/ip4/127.0.0.1/tcp/30002/p2p/QmQKp8pLWSgV4JiGjuULKV1JsdpxUtnDEUMP8sGaaUbwVL"
+# - "/ip4/127.0.0.1/tcp/30003/p2p/QmZXjZibcL5hy2Ttv5CnAQnssvnCbPEGBzqk7sAnL69R1E"
+# keypath is the netdisk private key path
+netpath: ./netkeys
+keypath: ./keys
+
+#logger
+module: gohotstuff
+filename: gohotstuff
+fmt: logfmt
+# debug | trace | info | warn | error
+level: debug
+# minutes
+rotateInterval: 60
+# days
+rotateBackups: 168
+# starndard output
+console: false
+async: false
+bufSize: 102400
+
+#state
+round: 0
+startk: lets_run_hotstuff
+startv: "{\"round\":0,\"id\":\"bGV0c19ydW5faG90c3R1ZmY=\",\"sender\":\"\",\"signs\":{}}"
+validators: 
+  - "Qmf2HeHe4sspGkfRCTq6257Vm3UHzvh2TeQJHHvHzzuFw6"
+  - "QmQKp8pLWSgV4JiGjuULKV1JsdpxUtnDEUMP8sGaaUbwVL"
+  - "QmZXjZibcL5hy2Ttv5CnAQnssvnCbPEGBzqk7sAnL69R1E"
