@@ -1,9 +1,11 @@
 # gohotstuff
 
-Gohotstuff is a go library which implements the chained-hotStuff consensus protocol, more precisely, the LibraBFT algorithmic core. 
+![md logo](https://github.com/aucusaga/gohotstuff/blob/main/image/hot_gopher.png)
+
+**Gohotstuff** is a go library which implements the chained-hotStuff consensus protocol, more precisely, the LibraBFT algorithmic core. 
 
 See the initialization of a state machine in our code as an example:
-~~~ go
+~~~ golang
 func createConsensus(name string, cc crypto.CryptoClient, cfg *state.ConsensusConfig, logger libs.Logger) (*state.State, error) {
 	// ticker is a timer that schedules timeouts conditional on the height/round/step in the timeoutInfo.
 	ticker := state.NewDefaultTimeoutTicker(logger)
@@ -31,3 +33,4 @@ func createConsensus(name string, cc crypto.CryptoClient, cfg *state.ConsensusCo
 	return smr, nil
 }
 ~~~
+
