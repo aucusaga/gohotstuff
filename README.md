@@ -1,6 +1,6 @@
 # gohotstuff
 
-![md logo](https://github.com/aucusaga/gohotstuff/blob/main/image/hot_gopher.png)
+<img src="https://raw.githubusercontent.com/aucusaga/gohotstuff/main/image/hot_gopher.png" width = "200" height = "200"/>
 
 **Gohotstuff** is a go library which implements the chained-hotStuff consensus protocol, more precisely, the LibraBFT algorithmic core. 
 
