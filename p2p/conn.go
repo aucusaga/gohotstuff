@@ -34,7 +34,6 @@ type DefaultConn struct {
 	peer   NodeInfo
 	stream network.Stream
 
-	send         chan int32
 	quit         chan struct{}
 	channels     []*Channel
 	channelsIdx  map[int32]*Channel
@@ -57,7 +56,6 @@ func NewDefaultConn(peer NodeInfo, netStream network.Stream,
 	dc := &DefaultConn{
 		peer:          peer,
 		stream:        netStream,
-		send:          make(chan int32, 1),
 		quit:          make(chan struct{}, 1),
 		channels:      make([]*Channel, 0),
 		channelsIdx:   make(map[int32]*Channel),
@@ -98,16 +96,7 @@ func (dc *DefaultConn) Send(chID int32, msgBytes []byte) bool {
 	}
 
 	success := channel.sendBytes(msgBytes)
-	if success {
-		// Wake up sendRoutine if necessary
-		select {
-		case dc.send <- chID:
-		default:
-		}
-		return success
-	}
-
-	dc.log.Error("send fail, queue timeout @ conn.Send, channel :%d, peer_id: %s", chID, dc.peer.ID())
+	dc.log.Info("send complete @ conn.Send, out: %v, channel :%d, peer_id: %s, msg: %s", success, chID, dc.peer.ID(), libs.GetSum(msgBytes))
 	return success
 }
 
@@ -123,43 +112,38 @@ func (dc *DefaultConn) FlushStop() {
 	// Send and flush all pending msgs.
 	// Since sendRoutine has exited, we can call this
 	// safely
-	for _, channel := range dc.channels {
-		dc.sendMsg(channel.id)
+	for _, ch := range dc.channels {
+		if len(ch.sendQueue) == 0 {
+			continue
+		}
+		for len(ch.sendQueue) > 0 {
+			select {
+			case bytes := <-ch.sendQueue:
+				ch.writeMsgTo(bytes)
+			default:
+			}
+		}
 	}
 
 	// Now we can close the connection
 	dc.stream.Close()
-	close(dc.send)
 	close(dc.quit)
 }
 
 func (dc *DefaultConn) sendRoutine() {
-LOOP:
-	select {
-	case ch := <-dc.send:
-		// send some msgs
-		dc.sendMsg(ch)
-		goto LOOP
-	case <-dc.quit:
-		break LOOP
+	for _, ch := range dc.channels {
+		ch := ch
+		go func() {
+			for {
+				select {
+				case bytes := <-ch.sendQueue:
+					ch.writeMsgTo(bytes)
+				case <-dc.quit:
+					return
+				}
+			}
+		}()
 	}
-}
-
-func (dc *DefaultConn) sendMsg(chID int32) bool {
-	channel, ok := dc.channelsIdx[chID]
-	if !ok {
-		dc.log.Error("cannot sendMsg, unknown channel @ conn.Send, channel: %d", chID)
-		return true
-	}
-	// If nothing to send, skip this channel
-	if !channel.isSendPending() {
-		return true
-	}
-	if err := channel.writeMsgTo(); err != nil {
-		dc.log.Error("failed to write @ sendMsg, channel_id: %d, err: %v", channel.id, err)
-		return true
-	}
-	return false
 }
 
 // TODO: stream reset
@@ -223,7 +207,6 @@ type Channel struct {
 	sendQueue     chan []byte
 	sendQueueSize int32 // atomic.
 	recving       []byte
-	sending       []byte
 
 	maxPacketMsgPayloadSize int
 
@@ -254,21 +237,18 @@ func (ch *Channel) sendBytes(bytes []byte) bool {
 	}
 }
 
-func (ch *Channel) writeMsgTo() error {
+func (ch *Channel) writeMsgTo(bytes []byte) error {
 	module, ok := libs.IDToModuleMap[ch.id]
 	if !ok {
 		return fmt.Errorf("channel id invalid, id: %d", ch.id)
 	}
-	id, err := libs.GenRandomID()
-	if err != nil {
-		return err
-	}
+	id := libs.GenRandomID()
 	packetMsg := &pb.PacketMsg{
 		LogId:     fmt.Sprintf("%d", id),
 		ChannelId: ch.id,
 		Module:    module,
 		Eof:       true,
-		Data:      ch.sending,
+		Data:      bytes,
 	}
 	packet := &pb.Packet{
 		Sum: &pb.Packet_PacketMsg{
@@ -276,20 +256,11 @@ func (ch *Channel) writeMsgTo() error {
 		},
 	}
 
-	err = ch.conn.bufConnWriter.WriteMsg(packet)
-	ch.log.Error("send succ @ conn.Send, channel: %d, to: %s, pkg :%+v, err: %v", ch.id, ch.conn.peer.ID(), packet.String(), err)
-	return err
-}
-
-// Returns true if any PacketMsgs are pending to be sent.
-// Call before calling nextPacketMsg()
-// Goroutine-safe
-func (ch *Channel) isSendPending() bool {
-	if len(ch.sending) == 0 {
-		if len(ch.sendQueue) == 0 {
-			return false
-		}
-		ch.sending = <-ch.sendQueue
+	err := ch.conn.bufConnWriter.WriteMsg(packet)
+	if err != nil {
+		ch.log.Error("send fail @ conn.Send, channel: %d, to: %s, msg :%s, err: %v", ch.id, ch.conn.peer.ID(), libs.GetSum(bytes), err)
+		return err
 	}
-	return true
+	ch.log.Info("send succ @ conn.Send, channel: %d, to: %s, msg :%s", ch.id, ch.conn.peer.ID(), libs.GetSum(bytes))
+	return nil
 }

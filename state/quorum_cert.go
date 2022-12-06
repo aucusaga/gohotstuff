@@ -2,6 +2,7 @@ package state
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/aucusaga/gohotstuff/libs"
 )
@@ -12,6 +13,7 @@ type QuorumCert interface {
 	Sender() (senderID string)
 	Signatures(peerID string) (signType int, sign []byte, pk []byte, err error)
 	Serialize() ([]byte, error)
+	String() string
 }
 
 // DefaultQuorumCert is the canonical implementation of the QuorumCert interface
@@ -19,7 +21,7 @@ type DefaultQuorumCert struct {
 	Round       int64  `json:"round"`
 	ID          []byte `json:"id"`
 	ParentRound int64  `json:"parent_round"`
-	ParentID    []byte `json:"parent_round"`
+	ParentID    []byte `json:"parent_id"`
 	SenderID    string `json:"sender"`
 
 	Signs map[string]DefaultSign `json:"signs"`
@@ -43,6 +45,9 @@ func NewDefaultQuorumCert(senderID string, sign []byte,
 
 func DefaultDeserialize(input []byte) (QuorumCert, error) {
 	var qc DefaultQuorumCert
+	if input == nil {
+		return qc, nil
+	}
 	if err := json.Unmarshal(input, &qc); err != nil {
 		return nil, err
 	}
@@ -70,6 +75,17 @@ func (qc DefaultQuorumCert) Signatures(peerID string) (int, []byte, []byte, erro
 
 func (qc DefaultQuorumCert) Serialize() ([]byte, error) {
 	return json.Marshal(qc)
+}
+
+func (qc DefaultQuorumCert) String() string {
+	var signs string
+	for peerID, s := range qc.Signs {
+		signs += fmt.Sprintf("[peer_id: %s, sign: %s] ", peerID, string(s.Sign))
+	}
+	basic := fmt.Sprintf("round: %d, id: %s, parent_round: %d, parent_id: %s, from: %s, signs: [%s]", qc.Round,
+		libs.F(qc.ID), qc.ParentRound, libs.F(qc.ParentID), qc.SenderID, signs)
+
+	return basic
 }
 
 type DefaultSign struct {

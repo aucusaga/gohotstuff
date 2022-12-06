@@ -1,7 +1,6 @@
 package state
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
@@ -19,6 +18,10 @@ const (
 
 	MsgQueueSize     = 1000
 	NoRollbackTmoIdx = 0
+
+	TimeoutProcess  = "TIMEOUT"
+	ProposalProcess = "PROPOSAL"
+	VoteProcess     = "VOTE"
 )
 
 var (
@@ -27,7 +30,8 @@ var (
 )
 
 var (
-	ErrVoteSetOccupied = errors.New("round has been occupied")
+	ErrVoteSetOccupied    = errors.New("round occupied")
+	ErrComponentsOccupied = errors.New("components occupied")
 )
 
 // State handles execution of the hotstuff consensus algorithm.
@@ -58,7 +62,7 @@ type State struct {
 	// wal WAL
 
 	// only for dropping stale msgs.
-	msgBucket sync.Map
+	// msgBucket sync.Map
 
 	// procedure mutex, ensures smr only handle one type msg per step.
 	mtx  sync.RWMutex
@@ -66,22 +70,19 @@ type State struct {
 	log  libs.Logger
 }
 
-func NewState(name PeerID, cc crypto.CryptoClient, timeout TimeoutTicker, logger libs.Logger,
-	cfg *ConsensusConfig) (*State, error) {
+func NewState(name PeerID, cc crypto.CryptoClient, timeout TimeoutTicker,
+	logger libs.Logger, cfg *ConsensusConfig) (*State, error) {
 	if logger == nil {
 		logger = logs.NewLogger()
 	}
 
 	tree, err := NewQCTree(name, cfg.StartRound, cfg.StartID,
-		cfg.StartValue, _unmarshal_qurumcert, _new_qurumcert)
+		cfg.StartValue, _unmarshal_qurumcert, _new_qurumcert, logger)
 	if err != nil {
 		logger.Error("build a new tree fail @ state.NewState, err: %v", err)
 		return nil, err
 	}
 
-	safetyrules := NewDefaultSafetyRules()
-	pacemaker := NewDefaultPacemaker(cfg.StartRound)
-	election := NewDefaultElection(cfg.StartRound, cfg.StartValidators)
 	s := &State{
 		crypto:        cc,
 		host:          name,
@@ -89,20 +90,48 @@ func NewState(name PeerID, cc crypto.CryptoClient, timeout TimeoutTicker, logger
 		peerMsgQueue:  make(chan MsgInfo, MsgQueueSize),
 		senderQueue:   make(chan MsgInfo, MsgQueueSize),
 		timeoutTicker: timeout,
-
-		safetyrules: safetyrules,
-		pacemaker:   pacemaker,
-		election:    election,
-		tree:        tree,
-		voteSet:     NewVoteSet(cfg.StartRound),
-		timeoutSet:  NewTimeoutSet(cfg.StartRound, cfg.StartTimeoutIdx),
-
-		quit: make(chan struct{}),
-		log:  logger,
+		tree:          tree,
+		voteSet:       NewVoteSet(cfg.StartRound),
+		timeoutSet:    NewTimeoutSet(cfg.StartRound, cfg.StartTimeoutIdx),
+		quit:          make(chan struct{}),
+		log:           logger,
 	}
 
-	s.log.Info("new a state succ, s: %+v", s)
+	s.log.Info("init a state succ, no components loaded, s: %+v", s)
 	return s, nil
+}
+
+func (s *State) RegisterPaceMaker(pacemaker Pacemaker) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	if s.pacemaker != nil {
+		return ErrComponentsOccupied
+	}
+	s.pacemaker = pacemaker
+	return nil
+}
+
+func (s *State) RegisterElection(election ProposerElection) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	if s.election != nil {
+		return ErrComponentsOccupied
+	}
+	s.election = election
+	return nil
+}
+
+func (s *State) RegisterSaftyrules(safetyrules SafetyRules) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	if s.safetyrules != nil {
+		return ErrComponentsOccupied
+	}
+	s.safetyrules = safetyrules
+	return nil
 }
 
 func (s *State) SetSwitch(p2p libs.Switch) {
@@ -127,7 +156,7 @@ func (s *State) Start() {
 func (s *State) HandleFunc(chID int32, msgbytes []byte) {
 	switch chID {
 	case libs.ConsensusChannel:
-		s.log.Info("receive msg: %s", GetSum(msgbytes))
+		s.log.Info("receive msg: %s", libs.GetSum(msgbytes))
 		msg, err := ConsMsgFromProto(msgbytes)
 		if err != nil {
 			s.log.Error("transfer msg from proto fail @ state.Handle, err: %v", err)
@@ -161,17 +190,17 @@ func (s *State) handleMsg(m MsgInfo) error {
 	}
 	switch t := m.(type) {
 	case *types.ProposalMsg:
-		s.log.Info("receive proposal @ handleMsg, msg: %s, proposal: %+v, id: %s", GetSum(msgbytes), t, string(t.ID))
+		s.log.Info("receive proposal @ handleMsg, msg: %s, proposal: %s", libs.GetSum(msgbytes), t.String())
 		if err := s.onReceiveProposal(t); err != nil {
 			s.log.Error("receive proposal fail @ state.handleMsg, proposal: %+v, err: %v", t, err)
 		}
 	case *types.VoteMsg:
-		s.log.Info("receive vote @ handleMsg, msg: %s, vote: %+v, id: %s", GetSum(msgbytes), t, string(t.ID))
+		s.log.Info("receive vote @ handleMsg, msg: %s, vote: %s", libs.GetSum(msgbytes), t.String())
 		if err := s.onReceiveVote(t); err != nil {
 			s.log.Error("receive votes fail @ state.handleMsg, vote: %+v, err: %v", t, err)
 		}
 	case *types.TimeoutMsg:
-		s.log.Info("receive timeout @ handleMsg, msg: %s, timeout: %+v", GetSum(msgbytes), t)
+		s.log.Info("receive timeout @ handleMsg, msg: %s, timeout: %s", libs.GetSum(msgbytes), t.String())
 		if err := s.onReceiveTimeout(t); err != nil {
 			s.log.Error("receive timeout fail @ state.handleMsg, timeout: %+v, err: %v", t, err)
 		}
@@ -188,27 +217,24 @@ func (s *State) handleMsg(m MsgInfo) error {
 // c. ledger checks whether to commit proposal's great grantparent qc,
 // d. block tree tries to insert proposal's new qc and update fresh new high qc,
 // e. send vote_msg to the next leader.
-//
 func (s *State) onReceiveProposal(proposal *types.ProposalMsg) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	s.log.Info("new proposal @ state.onReceiveProposal, proposal: %+v", proposal)
-
-	parentQC, err := s.tree.deserializeF(proposal.JustifyParent)
+	parentQC, err := s.tree.DeserializeF(proposal.JustifyParent)
 	if err != nil {
 		return fmt.Errorf("unmarshal parentQC fail @ state.onReceiveProposal, proposal: %+v, err: %v", proposal, err)
 	}
 	parentRound, parentID, err := parentQC.Proposal()
 	if err != nil {
-		return fmt.Errorf("invalid parentQC @ state.onReceiveProposal, parentQC: %+v, err: %v", parentQC, err)
+		return fmt.Errorf("invalid parentQC @ state.onReceiveProposal, parentQC: %s, err: %v", parentQC.String(), err)
 	}
 	pnode, err := s.tree.Search(parentRound, parentID)
 	if err != nil {
 		return fmt.Errorf("cannot find parent node in our local tree, parentQC: %+v, err: %v", parentQC, err)
 	}
 
-	newQC, err := s.tree.newQurumCertF(string(proposal.PeerID), proposal.Signature,
+	newQC, err := s.tree.NewQurumCertF(string(proposal.PeerID), proposal.Signature,
 		proposal.Round, proposal.ID, parentRound, parentID)
 	if err != nil {
 		return fmt.Errorf("fail to build newQC @ state.onReceiveProposal, proposal: %+v, err: %v", proposal, err)
@@ -217,21 +243,25 @@ func (s *State) onReceiveProposal(proposal *types.ProposalMsg) error {
 		return fmt.Errorf("check proposal fail @ state.onReceiveProposal, newQC: %+v, parentQC: %+v", newQC, parentQC)
 	}
 
+	// atomic operations
 	s.safetyrules.UpdatePreferredRound(parentRound)
 	if err := s.pacemaker.AdvanceRound(parentQC); err != nil {
 		return fmt.Errorf("pacemaker advanceRound fail @ state.onReceiveProposal, proposal: %+v, parentQC: %+v, err: %v",
 			proposal, parentQC, err)
 	}
-	if pnode.Parent != nil && pnode.Parent.Parent != nil {
-		s.tree.ProcessCommit(pnode.Parent.Parent.ID)
-	}
-	if err := s.tree.ExecuteNInsert(newQC); err != nil {
+	err = s.tree.ExecuteNInsert(newQC)
+	if err != nil && err != libs.ErrRepeatInsert {
 		return fmt.Errorf("insert qcTree fail @ state.onReceiveProposal, newQC: %+v, err: %v", newQC, err)
 	}
+	if pnode.Parent != nil && pnode.Parent.Parent != nil && pnode.Parent.Parent.Parent != nil {
+		s.tree.ProcessCommit(pnode.Parent.Parent.Parent.ID)
+	}
+	s.log.Info("receive a proposal ticket, proposal: %s, new_round: %d, high_qc: [%s], root_qc: [%s]",
+		newQC.String(), s.pacemaker.GetCurrentRound(), s.tree.GetCurrentHighQC().String(), s.tree.GetCurrentRoot().String())
 
-	nextLeader := s.election.Leader(s.pacemaker.GetCurrentRound(), nil)
+	nextRound := s.pacemaker.GetCurrentRound() + 1
+	nextLeader := s.election.Leader(nextRound, s.timeoutSet.GetTimeoutIdxMap())
 	s.senderQueue <- VoteMsg(proposal.Round, proposal.ID, parentRound, parentID, string(nextLeader))
-	s.NewRoundEvent()
 	return nil
 }
 
@@ -243,33 +273,34 @@ func (s *State) onReceiveVote(vote *types.VoteMsg) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	voteQC, err := s.tree.newQurumCertF(string(vote.SendID), vote.Signature, vote.Round,
+	voteQC, err := s.tree.NewQurumCertF(string(vote.SendID), vote.Signature, vote.Round,
 		vote.ID, vote.ParentRound, vote.ParentID)
 	if err != nil {
 		return fmt.Errorf("new a vote qc fail @ state.onReceiveVote, vote: %+v, err: %v", vote, err)
 	}
 	if err := s.safetyrules.CheckVote(voteQC); err != nil {
-		return fmt.Errorf("check vote fail @ state.onReceiveVote, vote: %+v, err: %v", voteQC, err)
+		return fmt.Errorf("check vote fail @ state.onReceiveVote, vote: %+v, err: %v", voteQC.String(), err)
 	}
-
-	validators := s.election.Validators(vote.Round, nil)
+	validators := s.election.Validators(vote.Round, s.timeoutSet.GetTimeoutIdxMap())
 	// add new vote info into the set
 	if err := s.voteSet.AddVote(vote.Round, vote.ID, PeerID(vote.SendID), validators); err != nil {
-		return fmt.Errorf("try to add vote fail @ state.onReceiveVote, vote: %+v, err: %v", vote, err)
+		return fmt.Errorf("try to add vote fail @ state.onReceiveVote, vote: %+v, err: %v", voteQC.String(), err)
 	}
+	s.log.Info("receive a vote ticket, vote: %s, validators: %+v", voteQC.String(), validators)
 	if !s.voteSet.HasTwoThirdsAny(vote.Round, vote.ID) {
 		return nil
 	}
-	s.log.Info("collect 2f + 1 votes, round: %d, id: %s", vote.Round, string(vote.ID))
 
+	// atomic operations
 	// the leader has received 2/3 votes, try to advance to the next round
 	if err := s.tree.ProcessVote(voteQC, validators); err != nil {
 		return fmt.Errorf("still collecting @ state.onReceiveVote , vote: %+v, err: %v", vote, err)
 	}
 	// pacemaker advance to the next round and broadcast new proposal
 	s.pacemaker.AdvanceRound(voteQC)
-	s.NewRoundEvent()
-
+	s.log.Info("collect 2f+1 votes, vote: %s, new_round: %d, high_qc: [%s]",
+		voteQC.String(), s.pacemaker.GetCurrentRound(), s.tree.GetCurrentHighQC().String())
+	s.NewRoundEvent(VoteProcess)
 	return nil
 }
 
@@ -280,31 +311,43 @@ func (s *State) onReceiveTimeout(timeout *types.TimeoutMsg) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	// timeout msg cannot predict the next id of the quromcert, so we always put a nil value.
-	tmo, err := s.tree.newQurumCertF(string(timeout.SendID), timeout.Signature,
-		timeout.Round, nil, timeout.ParentRound, timeout.ParentID)
+	// timeout msg cannot predict the next id of the quromcert, so we generate an unique one
+	tmo, err := s.tree.NewQurumCertF(string(timeout.SendID), timeout.Signature,
+		timeout.Round, s.getTimeoutID(timeout.Round, timeout.Index), timeout.ParentRound, timeout.ParentID)
 	if err != nil {
-		return fmt.Errorf("new a timeout qc fail @ state.onReceiveTimeout, timeout: %+v, err: %v", tmo, err)
+		return fmt.Errorf("new a timeout qc fail @ state.onReceiveTimeout, timeout: %+v, err: %v", tmo.String(), err)
 	}
 	if err := s.safetyrules.CheckTimeout(tmo); err != nil {
-		return fmt.Errorf("check vote fail @ state.onReceiveTimeout, timeout: %+v, err: %v", tmo, err)
+		return fmt.Errorf("check vote fail @ state.onReceiveTimeout, timeout: %+v, err: %v", tmo.String(), err)
 	}
 
-	validators := s.election.Validators(timeout.Round, nil)
+	validators := s.election.Validators(timeout.Round, s.timeoutSet.GetTimeoutIdxMap())
 	if err := s.timeoutSet.AddTimeout(timeout.Round, timeout.Index, PeerID(timeout.SendID), validators); err != nil {
-		return fmt.Errorf("try to add timeout fail @ state.onReceiveTimeout, timeout: %+v, err: %v", timeout, err)
+		return fmt.Errorf("try to add timeout fail @ state.onReceiveTimeout, timeout: %+v, err: %v", tmo.String(), err)
 	}
+	s.log.Info("receive a timeout ticket: %s, validators: %+v", tmo.String(), validators)
 	if !s.timeoutSet.HasTwoThirdsAny(timeout.Round, timeout.Index) {
 		return nil
 	}
 
-	s.log.Info("collect 2f + 1 timeout infos, round: %d, idx: %d", timeout.Round, timeout.Index)
+	// atomic operations
 	// collect 2/3 timeout msg, come to the new round
 	if err := s.pacemaker.ProcessTimeoutRound(tmo); err != nil {
-		return fmt.Errorf("still collecting timeout msg @ state.onReceiveTimeout, timeout: %+v, err: %v", tmo, err)
+		return fmt.Errorf("still collecting timeout msg @ state.onReceiveTimeout, timeout: %+v, err: %v", tmo.String(), err)
 	}
-	s.NewRoundEvent()
-
+	err = s.tree.ExecuteNInsert(tmo)
+	if err != nil {
+		if err != libs.ErrRepeatInsert {
+			return fmt.Errorf("insert qcTree fail @ state.onReceiveTimeout, newQC: %+v, err: %v", tmo.String(), err)
+		}
+		return nil
+	}
+	if err := s.tree.ProcessVote(tmo, validators); err != nil {
+		return fmt.Errorf("fail to update highQC @ state.onReceiveTimeout , newQC: %+v, err: %v", tmo.String(), err)
+	}
+	s.log.Info("collect 2f+1 tmos, tmo: %s, new_round: %d, high_qc: [%s]",
+		tmo.String(), s.pacemaker.GetCurrentRound(), s.tree.GetCurrentHighQC().String())
+	s.NewRoundEvent(TimeoutProcess)
 	return nil
 }
 
@@ -313,22 +356,12 @@ func (s *State) localTimeout(ti timeoutInfo) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	s.log.Info("tick-tock ends, timeout info: %+v", ti)
-
-	switch ti.Type {
-	case TypeCollectVotes:
-	case TypeNextRound:
-	}
-	if err := s.timeoutSet.Reset(ti.Round, NoRollbackTmoIdx); err != nil {
-		s.log.Error("reset fail @ local timeout, timeout info: %+v, err: %+v", ti, err)
-		return err
-	}
 	justify, err := s.tree.GetJustify()
 	if err != nil {
 		s.log.Error("justify fail @ local timeout, timeout info: %+v, err: %+v", ti, err)
 		return err
 	}
-	highQC, err := s.tree.deserializeF(justify)
+	highQC, err := s.tree.DeserializeF(justify)
 	if err != nil {
 		s.log.Error("deserialize fail @ local timeout, timeout info: %+v, err: %+v", ti, err)
 		return err
@@ -339,18 +372,38 @@ func (s *State) localTimeout(ti timeoutInfo) error {
 		return err
 	}
 
+	tmo, err := s.tree.NewQurumCertF(string(s.host), nil,
+		ti.Round, s.getTimeoutID(ti.Round, ti.Index), highRound, highID)
+	if err != nil {
+		return fmt.Errorf("new a timeout qc fail @ state.onReceiveTimeout, timeout: %+v, err: %v", tmo.String(), err)
+	}
+	// tmo info may be stale after the machine reveive vote/proposal/tmo msg
+	if err := s.safetyrules.CheckTimeout(tmo); err != nil {
+		return fmt.Errorf("check vote fail @ state.onReceiveTimeout, timeout: %+v, err: %v", tmo.String(), err)
+	}
+	s.log.Info("tick-tock ends, get timeout info: %+v", ti)
+	if err := s.timeoutSet.Reset(ti.Round, NoRollbackTmoIdx); err != nil {
+		s.log.Error("reset fail @ local timeout, timeout info: %+v, err: %+v", ti, err)
+		return err
+	}
+
 	s.senderQueue <- TimeoutMsg(int64(ti.Round), highRound, highID, s.timeoutSet.GetCurrentTimeoutIndex())
+	// tmo collecting should also follow timeout rules.
+	s.timeoutTicker.ScheduleTimeout(timeoutInfo{
+		Type:     TypeNextRound,
+		Duration: TimeoutT,
+		Round:    ti.Round,
+		Index:    s.timeoutSet.GetCurrentTimeoutIndex(),
+	})
 	return nil
 }
 
 func (s *State) schedule(m MsgInfo) error {
 	switch t := m.(type) {
 	case *types.ProposalMsg:
-		if PeerID(t.PeerID) == s.host {
-			s.peerMsgQueue <- m
-		}
 		t.Timestamp = time.Now().Unix()
 		t.PeerID = string(s.host)
+		s.peerMsgQueue <- m
 		// sign and put pk in the msg
 		msgbytes, err := ProtoFromConsMsg(t)
 		if err != nil {
@@ -361,14 +414,11 @@ func (s *State) schedule(m MsgInfo) error {
 			return err
 		}
 		s.p2p.Broadcast(libs.ConsensusChannel, newmsg)
-		s.log.Info("broadcast proposal msg: %s", GetSum(newmsg))
+		s.log.Info("broadcast proposal msg: %s", libs.GetSum(newmsg))
 	case *types.VoteMsg:
-		if PeerID(t.To) == s.host {
-			s.peerMsgQueue <- m
-			return nil
-		}
 		t.Timestamp = time.Now().Unix()
 		t.SendID = string(s.host)
+		s.peerMsgQueue <- m
 		// sign and put pk in the msg
 		msgbytes, err := ProtoFromConsMsg(t)
 		if err != nil {
@@ -383,12 +433,11 @@ func (s *State) schedule(m MsgInfo) error {
 			return err
 		}
 		s.p2p.Send(p2pID, libs.ConsensusChannel, newmsg)
-		s.log.Info("send vote msg: %s", GetSum(newmsg))
+		s.log.Info("send vote msg: %s", libs.GetSum(newmsg))
 	case *types.TimeoutMsg:
-		s.peerMsgQueue <- m
 		t.Timestamp = time.Now().Unix()
 		t.SendID = string(s.host)
-
+		s.peerMsgQueue <- m
 		// sign and put pk in the msg
 		msgbytes, err := ProtoFromConsMsg(t)
 		if err != nil {
@@ -399,7 +448,7 @@ func (s *State) schedule(m MsgInfo) error {
 			return err
 		}
 		s.p2p.Broadcast(libs.ConsensusChannel, newmsg)
-		s.log.Info("broadcast timeout msg: %s", GetSum(newmsg))
+		s.log.Info("broadcast timeout msg: %s", libs.GetSum(newmsg))
 	default:
 		return fmt.Errorf("unknown msginfo type @ state.schedule, type: %+v", t)
 	}
@@ -408,12 +457,12 @@ func (s *State) schedule(m MsgInfo) error {
 
 // NewRoundEvent starts a new timer for the next round and broadcasts the proposal
 // msg when the host is the leader.
-func (s *State) NewRoundEvent() error {
+func (s *State) NewRoundEvent(action string) error {
 	nextRound := s.pacemaker.GetCurrentRound()
-	nextLeader := s.election.Leader(nextRound, nil)
+	nextLeader := s.election.Leader(nextRound, s.timeoutSet.GetTimeoutIdxMap())
 	if nextLeader != s.host {
-		s.log.Info("process new round as a follower, round: %d, want: %+v, local: %+v",
-			int64(nextRound), nextLeader, s.host)
+		s.log.Info("process new round as a follower, process: %s, round: %d, want: %+v, local: %+v",
+			action, int64(nextRound), nextLeader, s.host)
 		s.timeoutTicker.ScheduleTimeout(timeoutInfo{
 			Type:     TypeNextRound,
 			Duration: TimeoutT,
@@ -425,20 +474,23 @@ func (s *State) NewRoundEvent() error {
 
 	// generate a new proposal in a new round as a leader,
 	// it's invoked after the host has collected full votes or full timeout qcs.
-	nextID, err := s.GetNextID()
-	if err != nil {
-		s.log.Error("generate next id @ state.generateProposal, round: %d, err: %v", nextRound, err)
-		return err
-	}
-	justify, err := s.tree.GetJustify()
-	if err != nil {
-		s.log.Error("cannot get justify from block tree @ state.generateProposal, round: %d, id: %s, err: %v", nextRound, string(nextID), err)
-		return err
+	if action == VoteProcess || action == TimeoutProcess {
+		nextID, err := s.GetNextID()
+		if err != nil {
+			s.log.Error("generate next id @ state.generateProposal, round: %d, err: %v", nextRound, err)
+			return err
+		}
+		justify, err := s.tree.GetJustify()
+		if err != nil {
+			s.log.Error("cannot get justify from block tree @ state.generateProposal, round: %d, id: %s, err: %v", nextRound, libs.F(nextID), err)
+			return err
+		}
+
+		proposal := ProposalMsg(nextRound, nextID, justify)
+		s.log.Info("process new round as a leader, process: %s, round: %d, id: %s, proposal: %+v", action, int64(nextRound), libs.F(nextID), proposal.String())
+		s.senderQueue <- proposal
 	}
 
-	proposal := ProposalMsg(nextRound, nextID, justify)
-	s.log.Info("process new round as a leader, round: %d, id: %s, proposal: %+v", int64(nextRound), string(nextID), proposal)
-	s.senderQueue <- proposal
 	s.timeoutTicker.ScheduleTimeout(timeoutInfo{
 		Type:     TypeCollectVotes,
 		Duration: TimeoutT,
@@ -449,12 +501,16 @@ func (s *State) NewRoundEvent() error {
 	return nil
 }
 
+// GetNextID tries to simulate the data encapsulation.
 func (s *State) GetNextID() ([]byte, error) {
-	id, err := libs.GenRandomID()
-	if err != nil {
-		return nil, err
-	}
-	return []byte(fmt.Sprintf("%X", id)), nil
+	// trick, proposal rate limit
+	time.Sleep(2 * time.Second)
+	id := libs.GenRandomID()
+	return []byte(fmt.Sprintf("%d", id)), nil
+}
+
+func (s *State) getTimeoutID(round int64, index int64) []byte {
+	return []byte(fmt.Sprintf("tmo_%d_%d", round, index))
 }
 
 //----------------------------------------------------------------
@@ -464,11 +520,4 @@ type ConsensusConfig struct {
 	StartID         string
 	StartValue      []byte
 	StartValidators []PeerID
-}
-
-func GetSum(b []byte) string {
-	h := sha256.New()
-	h.Write(b)
-	bs := h.Sum(nil)
-	return fmt.Sprintf("%x", bs)
 }

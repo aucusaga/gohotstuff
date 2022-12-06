@@ -9,6 +9,7 @@ type PeerID string
 // Message is a message that can be sent and received within peers
 type MsgInfo interface {
 	Validate() error
+	String() string
 }
 
 type WALMessage interface{}

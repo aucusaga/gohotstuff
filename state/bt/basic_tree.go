@@ -10,7 +10,7 @@ import (
 // Element's key should be unique.
 type BasicTree struct {
 	root   *Node
-	keySet map[string]struct{}
+	keySet map[string]*Node
 
 	mutex sync.RWMutex
 }
@@ -26,8 +26,9 @@ func NewBasicTree(rootRound int64, rootID string, rootValue []byte) (*BasicTree,
 	}
 	bt := BasicTree{
 		root:   &newR,
-		keySet: make(map[string]struct{}),
+		keySet: make(map[string]*Node),
 	}
+	bt.keySet[rootID] = bt.root
 	return &bt, bt.root, nil
 }
 
@@ -43,6 +44,7 @@ func (t *BasicTree) Insert(n Node) (*Node, error) {
 		return nil, libs.ErrRepeatInsert
 	}
 	insertedNode := Node{
+		Round:     n.Round,
 		ID:        n.ID,
 		Value:     n.Value,
 		ParentKey: n.ParentKey,
@@ -62,10 +64,10 @@ func (t *BasicTree) Insert(n Node) (*Node, error) {
 	if parent.Round >= n.Round {
 		return nil, libs.ErrWrongElement
 	}
-	t.keySet[n.ID] = struct{}{}
+	t.keySet[n.ID] = &insertedNode
 	insertedNode.Parent = parent
 	parent.Sons = append(parent.Sons, &insertedNode)
-	return parent, nil
+	return &insertedNode, nil
 }
 
 // Reset sets the input as a new root.
