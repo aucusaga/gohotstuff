@@ -7,35 +7,42 @@
 
 Start
 ------------------
-1. Compiling our project is simple
-~~~ shell
-	make
-~~~
-2. Cmds
-	
-    Dictionary **output** contains bin and configurations.Use command start to run up a single hotstuff node.
-~~~ shell
-	gohotstuff start
+
+### Compiling
+
+Our project is simple, pls use make only.
+
+### Cmds
+
+Dictionary ***/output*** contains bin and configurations.Use command start to run up a single hotstuff node.
+
+~~~shell
+    gohotstuff start
 ~~~ 
-    Gohotstuff uses [libp2p](https://github.com/libp2p/libp2p) to build peer-to-peer systems where the network key should be generated as an communication key, an identity as well. Please generate nodes own network key and crypto key before start-up.
+
+Gohotstuff uses [libp2p](https://github.com/libp2p/libp2p) to build peer-to-peer systems where the network key should be generated as an communication key, an identity as well. Please generate nodes own network key and crypto key before start-up.
+
 ~~~ shell
-	gohotstuff genkey --type network
+    gohotstuff genkey --type network
     gohotstuff genkey --type crypto
 ~~~ 
-	Network identity alse follows libp2p style, uses address type to preview the node's identity, the last slash part of which indicates the validator name.
+
+Network identity alse follows [libp2p](https://github.com/libp2p/libp2p) style, uses address type to preview the node's identity, the last slash part of which indicates ***the validator name***.
+
 ~~~ shell
     // output like: /ip4/127.0.0.1/tcp/30001/p2p/Qmf2HeHe4sspGkfRCTq6257Vm3UHzvh2TeQJHHvHzzuFw6
-    // use `/ip4/127.0.0.1/tcp/30001` as the local p2p address
-    // use `Qmf2HeHe4sspGkfRCTq6257Vm3UHzvh2TeQJHHvHzzuFw6` as the validator name.
+    // use '/ip4/127.0.0.1/tcp/30001' as the p2p address
+    // use 'Qmf2HeHe4sspGkfRCTq6257Vm3UHzvh2TeQJHHvHzzuFw6' as the validator name.
+    
     gohotstuff preview
 ~~~ 
 
 Configuration
 ------------------
-See the dictionary conf.
+See the dictionary ***/conf***.
 
 
-Build up a System
+Build up a system
 -------------------
 Use commands mentioned before can specify a new node with the new configuration. Also, we can start up different nodes with different network identities to build up a hotstuff peer-to-peer system.
 
@@ -73,3 +80,4 @@ func createConsensus(name string, cc crypto.CryptoClient, cfg *state.ConsensusCo
 	return smr, nil
 }
 ~~~
+
