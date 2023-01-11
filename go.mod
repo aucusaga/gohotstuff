@@ -13,5 +13,6 @@ require (
 	github.com/libp2p/go-libp2p-kad-dht v0.8.2
 	github.com/libp2p/go-libp2p-secio v0.2.2
 	github.com/multiformats/go-multiaddr v0.3.1
+	github.com/spf13/cobra v1.0.0
 	github.com/spf13/viper v1.6.2
 )

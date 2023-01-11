@@ -64,7 +64,7 @@ func NewNode(config *libs.Config) (*Node, error) {
 	logger := logs.NewLogger()
 
 	// load netkeys
-	netPath := filepath.Join("./conf", config.Netpath)
+	netPath := filepath.Join(filepath.Join(libs.GetCurRootDir(), "conf"), config.Netpath)
 	netPriKey, err := ioutil.ReadFile(filepath.Join(netPath, "private.key"))
 	if err != nil {
 		logger.Warn("load private key err, err: %+v", err)
@@ -92,7 +92,7 @@ func NewNode(config *libs.Config) (*Node, error) {
 	}
 
 	// load crypto keys
-	keypath := filepath.Join("./conf", config.Keypath)
+	keypath := filepath.Join(filepath.Join(libs.GetCurRootDir(), "conf"), config.Keypath)
 	priKey, err := ioutil.ReadFile(filepath.Join(keypath, "private.key"))
 	if err != nil {
 		logger.Warn("load private key err, err: %+v", err)

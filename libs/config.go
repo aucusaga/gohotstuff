@@ -2,7 +2,6 @@ package libs
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/spf13/viper"
 )
@@ -61,14 +60,4 @@ func loadConfig(cfgFile string) (*Config, error) {
 	}
 
 	return &config, nil
-}
-
-func FileIsExist(name string) bool {
-	if _, err := os.Stat(name); err != nil {
-		if os.IsNotExist(err) {
-			return false
-		}
-	}
-
-	return true
 }

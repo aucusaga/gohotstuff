@@ -4,8 +4,12 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"time"
 )
+
+var envCfg string
 
 func GenRandomID() uint64 {
 	nano := time.Now().UnixNano()
@@ -30,4 +34,41 @@ func GetSum(b []byte) string {
 
 func F(input []byte) string {
 	return string(input)
+}
+
+func SetRootDir(path string) {
+	if len(envCfg) <= 0 {
+		envCfg = path
+	}
+}
+
+func GetCurExecDir() string {
+	curDir, _ := filepath.Abs(filepath.Dir(os.Args[0]))
+	return curDir
+}
+
+func GetCurRootDir() string {
+	if len(envCfg) <= 0 {
+		curExecDir := GetCurExecDir()
+		envCfg = filepath.Dir(curExecDir)
+	}
+	return envCfg
+}
+
+func FileIsExist(name string) bool {
+	if _, err := os.Stat(name); err != nil {
+		if os.IsNotExist(err) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func MakeDir(name string) error {
+	err := os.MkdirAll(name, 0755)
+	if err != nil {
+		return err
+	}
+	return nil
 }

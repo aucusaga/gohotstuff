@@ -45,7 +45,8 @@ type Sign struct {
 }
 
 type Private struct {
-	X, Y, D *big.Int
+	Curvname string
+	X, Y, D  *big.Int
 }
 
 func InitCryptoClient(privateBytes []byte) error {

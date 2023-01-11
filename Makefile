@@ -28,4 +28,4 @@ gomod:
 build:
 	mkdir $(OUTDIR)
 	cp -r $(CONFDIR) $(OUTDIR)/
-	$(GOBUILD) -o $(OUTDIR)/gohotstuff $(HOMEDIR)/main.go
+	$(GOBUILD) -o $(OUTDIR)/gohotstuff $(HOMEDIR)/gohotstuff/main.go
